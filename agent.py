@@ -1,9 +1,10 @@
 """JobFit Agent, built with the OpenAI Agents SDK."""
 
 import asyncio
+import json
 from typing import Literal
 
-from agents import Agent, MaxTurnsExceeded, Runner, function_tool
+from agents import Agent, MaxTurnsExceeded, RunContextWrapper, Runner, function_tool
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -38,7 +39,7 @@ Your steps:
 2. Call read_resume with the resume file path to get the resume text.
 3. From the job post, list the must-have skills (at most 8). From the resume, list all of the person's skills.
 4. Call compare_skills with both lists. Always use the match score from compare_skills and copy its numbers exactly. Never make up a score yourself.
-5. Call save_to_tracker with the company, job title, match score and missing skills.
+5. Call save_to_tracker with the company and job title. It saves the match score and missing skills from compare_skills by itself.
 6. Write a cover letter of 120 to 180 words for this job, using only facts from the resume.
 
 Rules:
@@ -78,7 +79,7 @@ def read_resume(file_path: str) -> str:
 
 
 @function_tool
-def compare_skills(job_skills: list[str], resume_skills: list[str]) -> str:
+def compare_skills(run_context: RunContextWrapper[dict], job_skills: list[str], resume_skills: list[str]) -> str:
     """Compare the job's must-have skills with the resume skills. Use it for the match score.
 
     Args:
@@ -86,21 +87,27 @@ def compare_skills(job_skills: list[str], resume_skills: list[str]) -> str:
         resume_skills: The technical skills from the resume.
     """
     print("Step: comparing skills")
-    return tools.compare_skills(job_skills, resume_skills)
+    comparison_text = tools.compare_skills(job_skills, resume_skills)
+
+    # Keep the result for this run, so the tracker and the answer use the same score
+    run_context.context["comparison"] = json.loads(comparison_text)
+    return comparison_text
 
 
 @function_tool
-def save_to_tracker(company: str, job_title: str, match_score: int, missing_skills: list[str]) -> str:
+def save_to_tracker(run_context: RunContextWrapper[dict], company: str, job_title: str) -> str:
     """Save this job application to the tracker file. Use it after compare_skills.
+    The match score and missing skills are taken from compare_skills.
 
     Args:
         company: The company name.
         job_title: The job title.
-        match_score: The match score from compare_skills.
-        missing_skills: The missing skills from compare_skills.
     """
     print("Step: saving to the tracker")
-    return tools.save_to_tracker(company, job_title, match_score, missing_skills)
+    comparison = run_context.context.get("comparison")
+    if comparison is None:
+        return "Call compare_skills before save_to_tracker."
+    return tools.save_to_tracker(company, job_title, comparison["match_score"], comparison["missing_skills"])
 
 
 # ----- The agent -----
@@ -138,13 +145,26 @@ def build_message(resume_path: str, job_url: str, job_text: str) -> str:
     return f"{job_part}\n\nThe resume PDF file path is: {resume_path}"
 
 
+def use_comparison(final_output: JobFitResult, run_data: dict) -> JobFitResult:
+    """Put the score and skills from compare_skills into the answer, so they match the tracker."""
+    comparison = run_data.get("comparison")
+    if final_output.status == "ok" and comparison is not None:
+        final_output.match_score = comparison["match_score"]
+        final_output.matched_skills = comparison["matched_skills"]
+        final_output.missing_skills = comparison["missing_skills"]
+    return final_output
+
+
 async def run_agent(resume_path: str, job_url: str = "", job_text: str = "") -> JobFitResult:
     """Run the JobFit agent on one resume and one job."""
     message = build_message(resume_path, job_url, job_text)
 
+    # Data shared by the tools during this one run (the compare_skills result)
+    run_data = {}
+
     # Run the agent. Stop it with a plain message if something goes wrong
     try:
-        result = await Runner.run(jobfit_agent, message, max_turns=MAX_TURNS)
+        result = await Runner.run(jobfit_agent, message, max_turns=MAX_TURNS, context=run_data)
     except MaxTurnsExceeded:
         return stopped_result(f"Stopped: the agent did not finish within {MAX_TURNS} turns.")
     except Exception as error:
@@ -156,7 +176,7 @@ async def run_agent(resume_path: str, job_url: str = "", job_text: str = "") -> 
     print(f"Tokens used: {total_tokens}")
     if total_tokens > TOKEN_WARNING:
         print(f"Warning: this run used more than {TOKEN_WARNING} tokens.")
-    return result.final_output
+    return use_comparison(result.final_output, run_data)
 
 
 def print_result(result: JobFitResult) -> None:
