@@ -19,3 +19,17 @@ tracker.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Python virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Environment variables and secrets
+.env
+.streamlit/secrets.toml
+
+# Test cache
+.pytest_cache/
